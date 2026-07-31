@@ -678,6 +678,25 @@ int zebra_rib_labeled_unicast(struct route_entry *re)
 	return 1;
 }
 
+/*
+ * Return true if the RE's primary nexthop is a single blackhole nexthop.
+ * Used to scope the notify-on-install fallback for aggregates / null routes
+ * where the ASIC offload echo (RTM_F_OFFLOAD) is not always guaranteed.
+ */
+static bool rib_re_is_blackhole(const struct route_entry *re)
+{
+	const struct nexthop *nh;
+
+	if (!re || !re->nhe || !re->nhe->nhg.nexthop)
+		return false;
+
+	nh = re->nhe->nhg.nexthop;
+	if (nh->next != NULL)
+		return false;
+
+	return nh->type == NEXTHOP_TYPE_BLACKHOLE;
+}
+
 /* Update flag indicates whether this is a "replace" or not. Currently, this
  * is only used for IPv4.
  */
@@ -2170,12 +2189,30 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
 						zsend_route_notify_owner_ctx(
 							ctx,
 							ZAPI_ROUTE_INSTALLED);
-					if (CHECK_FLAG(
+					else if (CHECK_FLAG(
 						    re->flags,
 						    ZEBRA_FLAG_OFFLOAD_FAILED))
 						zsend_route_notify_owner_ctx(
 							ctx,
 							ZAPI_ROUTE_FAIL_INSTALL);
+					else if (rib_re_is_blackhole(re))
+						/*
+						 * Blackhole route (e.g. BGP
+						 * aggregate) successfully
+						 * installed but no OFFLOADED
+						 * echo expected.  The kernel
+						 * IPv4 FIB may suppress
+						 * RTM_NEWROUTE broadcasts on
+						 * identical NLM_F_REPLACE, so
+						 * the ASIC offload echo never
+						 * arrives for these routes.
+						 * Notify the owner now to
+						 * prevent indefinite
+						 * FIB_INSTALL_PENDING.
+						 */
+						zsend_route_notify_owner_ctx(
+							ctx,
+							ZAPI_ROUTE_INSTALLED);
 				}
 			}
 		} else {
